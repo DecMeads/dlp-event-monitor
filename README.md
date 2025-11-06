@@ -84,3 +84,6 @@ go run main.go
 - **Language**: Go
 - **UI Framework**: [Bubble Tea](https://github.com/charmbracelet/bubbletea)
 - **Styling**: [Lipgloss](https://github.com/charmbracelet/lipgloss)
+
+## Demo
+![Demo](DLP-Demo.gif)
