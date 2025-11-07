@@ -32,11 +32,11 @@ var (
 			MarginBottom(1)
 
 	statCardStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(cardColor).
-			Padding(1, 2).
-			Width(20).
-			Height(4)
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(cardColor).
+		Padding(1, 2).
+		Width(18).
+		Height(4)
 
 	titleTextStyle = lipgloss.NewStyle().
 			Foreground(mutedColor).
@@ -106,7 +106,19 @@ var (
 				Foreground(warningColor)
 
 	noAlertsStyle = lipgloss.NewStyle().
-			Foreground(successColor).
-			Bold(true).
-			Padding(1, 2)
+		Foreground(successColor).
+		Bold(true).
+		Padding(1, 2)
+
+	learningIndicatorStyle = lipgloss.NewStyle().
+		Foreground(warningColor).
+		Bold(true)
+
+	activeIndicatorStyle = lipgloss.NewStyle().
+		Foreground(successColor).
+		Bold(true)
+
+	dangerColorStyle = lipgloss.NewStyle().
+		Foreground(dangerColor).
+		Bold(true)
 )

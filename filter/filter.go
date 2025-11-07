@@ -1,6 +1,7 @@
 package filter
 
 import (
+	"channel_filter/config"
 	"channel_filter/event"
 	"strings"
 	"time"
@@ -20,12 +21,24 @@ type UserActivity struct {
 	SensitiveAccess map[string][]ActivityRecord
 }
 
-type Filter struct {
-	activity UserActivity
-	window   time.Duration
+type CompromisedUser struct {
+	DetectedAt             time.Time
+	ActionsAfterCompromise int
+	IsDetected             bool
 }
 
-func NewFilter() *Filter {
+type Filter struct {
+	activity    UserActivity
+	window      time.Duration
+	baselines   map[string]*UserBaseline
+	compromised map[string]*CompromisedUser
+	config      *config.Config
+}
+
+func NewFilter(cfg *config.Config) *Filter {
+	if cfg == nil {
+		cfg = config.DefaultConfig()
+	}
 	return &Filter{
 		activity: UserActivity{
 			Downloads:       make(map[string][]ActivityRecord),
@@ -33,8 +46,20 @@ func NewFilter() *Filter {
 			ExternalEmails:  make(map[string][]ActivityRecord),
 			SensitiveAccess: make(map[string][]ActivityRecord),
 		},
-		window: 5 * time.Minute,
+		window:      cfg.Window.Duration,
+		baselines:   make(map[string]*UserBaseline),
+		compromised: make(map[string]*CompromisedUser),
+		config:      cfg,
 	}
+}
+
+func (f *Filter) getOrCreateBaseline(user string) *UserBaseline {
+	baseline, exists := f.baselines[user]
+	if !exists {
+		baseline = NewUserBaseline(user, &f.config.Detection)
+		f.baselines[user] = baseline
+	}
+	return baseline
 }
 
 func (f *Filter) cleanOldRecords(records []ActivityRecord) []ActivityRecord {
@@ -78,43 +103,73 @@ func (f *Filter) isExternalAction(action string) bool {
 
 func (f *Filter) updateActivity(evt event.Event) {
 	record := ActivityRecord{Action: evt.Action, Timestamp: evt.Timestamp}
+	baseline := f.getOrCreateBaseline(evt.User)
 
 	if f.isDownloadAction(evt.Action) {
 		f.activity.Downloads[evt.User] = append(f.activity.Downloads[evt.User], record)
 		f.activity.Downloads[evt.User] = f.cleanOldRecords(f.activity.Downloads[evt.User])
+		count := len(f.activity.Downloads[evt.User])
+		baseline.UpdateWindowCount("downloads", count)
+		baseline.UpdateActionStats("downloads", float64(count), evt.Timestamp, f.config.Detection.MaxSamples)
 	}
 
 	if evt.Action == "copied_to_usb" {
 		f.activity.USBCopies[evt.User] = append(f.activity.USBCopies[evt.User], record)
 		f.activity.USBCopies[evt.User] = f.cleanOldRecords(f.activity.USBCopies[evt.User])
+		count := len(f.activity.USBCopies[evt.User])
+		baseline.UpdateWindowCount("usb_copies", count)
+		baseline.UpdateActionStats("usb_copies", float64(count), evt.Timestamp, f.config.Detection.MaxSamples)
 	}
 
 	if f.isExternalAction(evt.Action) {
 		f.activity.ExternalEmails[evt.User] = append(f.activity.ExternalEmails[evt.User], record)
 		f.activity.ExternalEmails[evt.User] = f.cleanOldRecords(f.activity.ExternalEmails[evt.User])
+		count := len(f.activity.ExternalEmails[evt.User])
+		baseline.UpdateWindowCount("external_actions", count)
+		baseline.UpdateActionStats("external_actions", float64(count), evt.Timestamp, f.config.Detection.MaxSamples)
 	}
 
 	if f.isSensitiveResource(evt.Resource) {
 		f.activity.SensitiveAccess[evt.User] = append(f.activity.SensitiveAccess[evt.User], record)
 		f.activity.SensitiveAccess[evt.User] = f.cleanOldRecords(f.activity.SensitiveAccess[evt.User])
+		count := len(f.activity.SensitiveAccess[evt.User])
+		baseline.UpdateWindowCount("sensitive_access", count)
+		baseline.UpdateActionStats("sensitive_access", float64(count), evt.Timestamp, f.config.Detection.MaxSamples)
 	}
+
+	baseline.RecordEvent()
 }
 
 func (f *Filter) isSuspicious(evt event.Event) bool {
-	downloads := len(f.activity.Downloads[evt.User])
-	usbCopies := len(f.activity.USBCopies[evt.User])
-	externalActions := len(f.activity.ExternalEmails[evt.User])
-	sensitiveAccess := len(f.activity.SensitiveAccess[evt.User])
+	baseline := f.getOrCreateBaseline(evt.User)
+
+	if baseline.LearningPhase {
+		return false
+	}
 
 	if f.isSensitiveResource(evt.Resource) && f.isExternalAction(evt.Action) {
 		return true
 	}
 
-	if downloads > 10 || usbCopies > 3 || externalActions > 5 || sensitiveAccess > 2 {
+	downloads := baseline.GetWindowCount("downloads")
+	usbCopies := baseline.GetWindowCount("usb_copies")
+	externalActions := baseline.GetWindowCount("external_actions")
+	sensitiveAccess := baseline.GetWindowCount("sensitive_access")
+
+	if baseline.IsAnomaly("downloads", float64(downloads)) {
+		return true
+	}
+	if baseline.IsAnomaly("usb_copies", float64(usbCopies)) {
+		return true
+	}
+	if baseline.IsAnomaly("external_actions", float64(externalActions)) {
+		return true
+	}
+	if baseline.IsAnomaly("sensitive_access", float64(sensitiveAccess)) {
 		return true
 	}
 
-	if strings.Contains(evt.User, "contractor") && sensitiveAccess > 0 {
+	if strings.Contains(strings.ToLower(evt.User), "contractor") && sensitiveAccess > 0 {
 		return true
 	}
 
@@ -132,14 +187,67 @@ func (f *Filter) Filter(eventCh <-chan event.Event, alertCh chan<- event.Event) 
 }
 
 func (f *Filter) FilterWithTUI(eventCh <-chan event.Event, alertCh chan<- event.Event, program *tea.Program) {
+	tuiChannel := make(chan event.TUIEventMsg, 1000)
+
+	go func() {
+		for msg := range tuiChannel {
+			program.Send(msg)
+		}
+	}()
+
 	for evt := range eventCh {
 		f.updateActivity(evt)
+		baseline := f.getOrCreateBaseline(evt.User)
 
 		isAlert := f.isSuspicious(evt)
-		if isAlert {
-			alertCh <- evt
+
+		isCompromised := false
+		actionsAfterCompromise := 0
+
+		var timeToDetection time.Duration
+		comp, exists := f.compromised[evt.User]
+		if exists {
+			comp.ActionsAfterCompromise++
+			isCompromised = true
+			actionsAfterCompromise = comp.ActionsAfterCompromise
+			if !evt.CompromisedAt.IsZero() {
+				timeToDetection = comp.DetectedAt.Sub(evt.CompromisedAt)
+			}
+		} else if isAlert && !baseline.LearningPhase {
+			detectedAt := time.Now()
+			f.compromised[evt.User] = &CompromisedUser{
+				DetectedAt:             detectedAt,
+				ActionsAfterCompromise: 1,
+				IsDetected:             true,
+			}
+			isCompromised = true
+			actionsAfterCompromise = 1
+			if !evt.CompromisedAt.IsZero() {
+				timeToDetection = detectedAt.Sub(evt.CompromisedAt)
+			}
+		} else if !evt.CompromisedAt.IsZero() {
+			isCompromised = true
 		}
 
-		program.Send(event.TUIEventMsg{Event: evt, IsAlert: isAlert})
+		if isAlert {
+			select {
+			case alertCh <- evt:
+			default:
+			}
+		}
+
+		select {
+		case tuiChannel <- event.TUIEventMsg{
+			Event:                  evt,
+			IsAlert:                isAlert,
+			LearningPhase:          baseline.LearningPhase,
+			LearningEvents:         baseline.LearningEvents,
+			IsCompromised:          isCompromised,
+			ActionsAfterCompromise: actionsAfterCompromise,
+			TimeToDetection:        timeToDetection,
+		}:
+		default:
+		}
 	}
+	close(tuiChannel)
 }

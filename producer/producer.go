@@ -6,69 +6,155 @@ import (
 	"time"
 )
 
-type Producer struct {
-	producer_id   string
-	message_count int
+type UserProducer struct {
+	user                   User
+	markovChain            *MarkovChain
+	maliciousChain         *MarkovChain
+	resources              []string
+	currentState           string
+	messageCount           int
+	producerID             string
+	IsCompromised          bool
+	CompromisedAt          time.Time
+	ActionsAfterCompromise int
+	learningComplete       bool
+	compromiseProb         float64
 }
 
-func NewProducer(producer_id string) *Producer {
-	return &Producer{
-		producer_id: producer_id,
+func NewUserProducer(user User, producerID string) *UserProducer {
+	markovChain := GetRoleMarkovChain(user.Role)
+	maliciousChain := GetMaliciousMarkovChain()
+	resources := GetRoleResources(user.Role)
+
+	return &UserProducer{
+		user:                   user,
+		markovChain:            markovChain,
+		maliciousChain:         maliciousChain,
+		resources:              resources,
+		currentState:           "",
+		producerID:             producerID,
+		IsCompromised:          false,
+		ActionsAfterCompromise: 0,
+		learningComplete:       false,
+		compromiseProb:         0.001, // 0.1% chance
 	}
 }
 
-func (p *Producer) createRandomEvent() event.Event {
-	users := []string{
-		"hr.alice.johnson", "hr.bob.wilson", "finance.carol.davis",
-		"finance.david.miller", "marketing.eve.brown", "engineering.frank.garcia",
-		"sales.grace.martinez", "legal.henry.taylor", "it.admin.root",
-		"contractor.mike.temp", "contractor.sarah.ext", "vendor.john.consultant",
-		"temp.lisa.summer", "contractor.alex.qa",
-		"exec.ceo.smith", "exec.cfo.jones", "exec.hr.director",
+func (up *UserProducer) createEvent() event.Event {
+	if !up.IsCompromised && up.learningComplete {
+		if rand.Float64() < up.compromiseProb {
+			up.IsCompromised = true
+			up.CompromisedAt = time.Now()
+			up.currentState = ""
+		}
 	}
 
-	actions := []string{
-		"downloaded", "uploaded_to_cloud", "copied_to_usb", "emailed_external",
-		"bulk_downloaded", "accessed", "deleted", "modified", "shared_externally",
-		"printed", "screenshot_taken", "copied_to_clipboard",
+	var action string
+	if up.IsCompromised {
+		action = up.maliciousChain.GetNextAction(up.currentState)
+		up.ActionsAfterCompromise++
+	} else {
+		action = up.markovChain.GetNextAction(up.currentState)
 	}
+	up.currentState = action
 
-	resources := []string{
-		"customer_database.csv", "employee_ssn_list.xlsx", "payroll_q4_2024.xlsx",
-		"credit_card_data.csv", "bank_account_details.pdf", "tax_records_2024.xlsx",
-		"confidential_merger_docs.docx", "salary_survey_data.csv",
-		"sales_pipeline_q1.xlsx", "client_contract_template.docx", "budget_forecast_2025.xlsx",
-		"product_roadmap_internal.pptx", "vendor_pricing_list.csv", "performance_reviews.pdf",
-		"marketing_strategy_2024.docx", "competitive_analysis.xlsx",
-		"company_logo.png", "public_readme.txt", "meeting_notes_general.docx",
-		"training_materials.pdf", "org_chart_public.pdf", "company_handbook.pdf",
-		"office_photos.zip", "presentation_template.pptx",
-		"https://drive.google.com/sensitive_data", "https://dropbox.com/client_files",
-		"\\\\shared_drive\\hr\\confidential", "ftp://vendor.com/upload",
-		"email_attachment_financial_report.pdf",
+	resource := up.selectResource(up.IsCompromised)
+
+	timeVariance := time.Duration(rand.ExpFloat64()*3000) * time.Millisecond
+	if timeVariance > 10*time.Second {
+		timeVariance = 10 * time.Second
 	}
-
-	timeVariance := time.Duration(rand.Intn(3600)) * time.Second
 	eventTime := time.Now().Add(-timeVariance)
 
-	return event.Event{
-		User:       users[rand.Intn(len(users))],
-		Action:     actions[rand.Intn(len(actions))],
-		Resource:   resources[rand.Intn(len(resources))],
+	evt := event.Event{
+		User:       up.user.Name,
+		Action:     action,
+		Resource:   resource,
 		Timestamp:  eventTime,
-		ProducerId: p.producer_id,
+		ProducerId: up.producerID,
 	}
+	if up.IsCompromised {
+		evt.CompromisedAt = up.CompromisedAt
+	}
+	return evt
 }
 
-func (p *Producer) Produce(ch chan<- event.Event) {
+func (up *UserProducer) selectResource(isCompromised bool) string {
+	if isCompromised {
+		sensitiveResources := []string{
+			"customer_database.csv", "employee_ssn_list.xlsx", "payroll_q4_2024.xlsx",
+			"credit_card_data.csv", "bank_account_details.pdf", "tax_records_2024.xlsx",
+			"confidential_merger_docs.docx", "salary_survey_data.csv",
+		}
+		if rand.Float64() < 0.7 {
+			return sensitiveResources[rand.Intn(len(sensitiveResources))]
+		}
+	}
+
+	roleSpecificCount := len(up.resources) / 2
+	if roleSpecificCount == 0 {
+		roleSpecificCount = len(up.resources)
+	}
+	if rand.Float64() < 0.7 && roleSpecificCount > 0 {
+		return up.resources[rand.Intn(roleSpecificCount)]
+	}
+	return up.resources[rand.Intn(len(up.resources))]
+}
+
+func (up *UserProducer) Produce(ch chan<- event.Event) {
+	baseInterval := up.getBaseInterval()
 	for {
-		evt := p.createRandomEvent()
-		p.message_count++
+		evt := up.createEvent()
+		up.messageCount++
+
+		if !up.learningComplete && up.messageCount >= 50 {
+			up.learningComplete = true
+		}
+
 		ch <- evt
-		time.Sleep(time.Duration(rand.Intn(2000)+500) * time.Millisecond)
+
+		interval := time.Duration(rand.ExpFloat64()*float64(baseInterval)) * time.Millisecond
+		if interval < 500*time.Millisecond {
+			interval = 500 * time.Millisecond
+		}
+		if interval > 15*time.Second {
+			interval = 15 * time.Second
+		}
+		time.Sleep(interval)
 	}
 }
 
-func (p *Producer) GetMessageCount() int {
-	return p.message_count
+func (up *UserProducer) getBaseInterval() int {
+	switch up.user.Role {
+	case RoleCEO:
+		return 5000
+	case RoleEngineer:
+		return 2000
+	case RoleContractor:
+		return 4000
+	case RoleHR:
+		return 3000
+	case RoleFinance:
+		return 3500
+	case RoleITAdmin:
+		return 2500
+	default:
+		return 3000
+	}
+}
+
+func (up *UserProducer) GetMessageCount() int {
+	return up.messageCount
+}
+
+func (up *UserProducer) GetUser() User {
+	return up.user
+}
+
+func (up *UserProducer) SetLearningComplete() {
+	up.learningComplete = true
+}
+
+func (up *UserProducer) GetCompromiseStats() (bool, time.Time, int) {
+	return up.IsCompromised, up.CompromisedAt, up.ActionsAfterCompromise
 }

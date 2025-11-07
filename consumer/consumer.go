@@ -16,7 +16,7 @@ func NewConsumer() *Consumer {
 func (c *Consumer) Consume(ch <-chan event.Event) {
 	for event := range ch {
 		c.flagged_message_count++
-		fmt.Printf("🚨 ALERT: %s - (P%s) User %s %s resource %s\n",
+		fmt.Printf("🚨 ALERT: %s - (%s) User %s %s resource %s\n",
 			event.Timestamp.Format("Jan 2, 2006 15:04:05.000"),
 			event.ProducerId,
 			event.User,

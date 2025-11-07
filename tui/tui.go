@@ -17,15 +17,20 @@ type StatsMsg struct {
 }
 
 type Model struct {
-	spinner      spinner.Model
-	totalEvents  int
-	totalAlerts  int
-	recentEvents []event.TUIEventMsg
-	alertEvents  []event.TUIEventMsg
-	userStats    map[string]int
-	lastUpdate   time.Time
-	width        int
-	height       int
+	spinner          spinner.Model
+	totalEvents      int
+	totalAlerts      int
+	recentEvents     []event.TUIEventMsg
+	alertEvents      []event.TUIEventMsg
+	userStats        map[string]int
+	userLearning     map[string]bool
+	usersInLearning  int
+	usersActive      int
+	compromisedUsers map[string]int
+	totalCompromised int
+	lastUpdate       time.Time
+	width            int
+	height           int
 }
 
 func New() Model {
@@ -34,11 +39,16 @@ func New() Model {
 	s.Style = spinnerStyle
 
 	return Model{
-		spinner:      s,
-		recentEvents: make([]event.TUIEventMsg, 0),
-		alertEvents:  make([]event.TUIEventMsg, 0),
-		userStats:    make(map[string]int),
-		lastUpdate:   time.Now(),
+		spinner:          s,
+		recentEvents:     make([]event.TUIEventMsg, 0),
+		alertEvents:      make([]event.TUIEventMsg, 0),
+		userStats:        make(map[string]int),
+		userLearning:     make(map[string]bool),
+		usersInLearning:  0,
+		usersActive:      0,
+		compromisedUsers: make(map[string]int),
+		totalCompromised: 0,
+		lastUpdate:       time.Now(),
 	}
 }
 
@@ -70,6 +80,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.alertEvents) > 20 {
 				m.alertEvents = m.alertEvents[:20]
 			}
+		}
+
+		wasLearning, userExists := m.userLearning[msg.Event.User]
+		if !userExists {
+			if msg.LearningPhase {
+				m.usersInLearning++
+			} else {
+				m.usersActive++
+			}
+		} else if wasLearning && !msg.LearningPhase {
+			m.usersInLearning--
+			m.usersActive++
+		} else if !wasLearning && msg.LearningPhase {
+			m.usersActive--
+			m.usersInLearning++
+		}
+		m.userLearning[msg.Event.User] = msg.LearningPhase
+
+		if msg.IsCompromised {
+			if _, exists := m.compromisedUsers[msg.Event.User]; !exists {
+				m.totalCompromised++
+			}
+			m.compromisedUsers[msg.Event.User] = msg.ActionsAfterCompromise
 		}
 
 		m.userStats[msg.Event.User]++
@@ -130,8 +163,11 @@ func (m Model) renderStats() string {
 	eventsCard := m.createStatCard("📊 Total Events", fmt.Sprintf("%d", m.totalEvents))
 	alertsCard := m.createStatCard("🚨 Alerts", fmt.Sprintf("%d", m.totalAlerts))
 	rateCard := m.createStatCard("📈 Alert Rate", m.calculateAlertRate())
+	learningCard := m.createStatCard("📚 Learning", fmt.Sprintf("%d users", m.usersInLearning))
+	activeCard := m.createStatCard("✅ Active", fmt.Sprintf("%d users", m.usersActive))
+	compromisedCard := m.createStatCard("⚠️ Compromised", fmt.Sprintf("%d users", m.totalCompromised))
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, eventsCard, "  ", alertsCard, "  ", rateCard)
+	return lipgloss.JoinHorizontal(lipgloss.Top, eventsCard, "  ", alertsCard, "  ", rateCard, "  ", learningCard, "  ", activeCard, "  ", compromisedCard)
 }
 
 func (m Model) createStatCard(title, value string) string {
@@ -162,6 +198,7 @@ func (m Model) renderRecentActivity() string {
 
 		var style lipgloss.Style
 		var icon string
+		var phaseIndicator string
 		if eventMsg.IsAlert {
 			style = alertEventStyle
 			icon = "🚨"
@@ -170,8 +207,16 @@ func (m Model) renderRecentActivity() string {
 			icon = "📄"
 		}
 
-		eventLine := fmt.Sprintf("%s %s | P%s | %s | %s | %s",
-			icon, timeStr, evt.ProducerId, evt.User, evt.Action, evt.Resource)
+		if eventMsg.IsCompromised {
+			phaseIndicator = dangerColorStyle.Render(fmt.Sprintf("⚠️(%d)", eventMsg.ActionsAfterCompromise))
+		} else if eventMsg.LearningPhase {
+			phaseIndicator = learningIndicatorStyle.Render(fmt.Sprintf("📚(%d)", eventMsg.LearningEvents))
+		} else {
+			phaseIndicator = activeIndicatorStyle.Render("✅")
+		}
+
+		eventLine := fmt.Sprintf("%s %s %s | %s | %s | %s",
+			icon, phaseIndicator, timeStr, evt.User, evt.Action, evt.Resource)
 
 		if len(eventLine) > m.width-4 {
 			eventLine = eventLine[:m.width-7] + "..."
@@ -249,8 +294,23 @@ func (m Model) renderAlerts() string {
 		evt := alertMsg.Event
 		timeStr := evt.Timestamp.Format("15:04:05")
 
+		var phaseStatus string
+		if alertMsg.IsCompromised {
+			if alertMsg.TimeToDetection > 0 {
+				ttdSeconds := int(alertMsg.TimeToDetection.Seconds())
+				phaseStatus = fmt.Sprintf("⚠️ Compromised (%d actions, TTD: %ds)", alertMsg.ActionsAfterCompromise, ttdSeconds)
+			} else {
+				phaseStatus = fmt.Sprintf("⚠️ Compromised (%d actions)", alertMsg.ActionsAfterCompromise)
+			}
+		} else if alertMsg.LearningPhase {
+			phaseStatus = fmt.Sprintf("📚 Learning (%d/%d)", alertMsg.LearningEvents, 50)
+		} else {
+			phaseStatus = "✅ Active"
+		}
+
 		alertLine := fmt.Sprintf("🔥 %s | %s", timeStr, evt.User)
 		actionLine := fmt.Sprintf("   %s → %s", evt.Action, evt.Resource)
+		phaseLine := fmt.Sprintf("   Status: %s", phaseStatus)
 
 		maxWidth := 45
 		if len(actionLine) > maxWidth {
@@ -260,6 +320,7 @@ func (m Model) renderAlerts() string {
 		alertBlock := strings.Join([]string{
 			alertHeaderStyle.Render(alertLine),
 			alertDetailStyle.Render(actionLine),
+			alertDetailStyle.Render(phaseLine),
 		}, "\n")
 
 		alerts = append(alerts, alertBlock)
